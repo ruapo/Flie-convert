@@ -19,12 +19,30 @@ logging.getLogger("pikepdf").setLevel(logging.ERROR)
 Image.MAX_IMAGE_PIXELS = None
 os.environ["PYDEVD_DISABLE_FILE_VALIDATION"] = "1"
 
+
 def get_real_desktop_path():
     try:
         from win32com.shell import shell, shellcon
-        return shell.SHGetFolderPath(0, shellcon.CSIDL_DESKTOP, None, 0)
+        desktop = shell.SHGetFolderPath(0, shellcon.CSIDL_DESKTOP, None, 0)
+        if desktop and os.path.exists(desktop) and os.access(desktop, os.W_OK):
+            return desktop
     except:
-        return os.path.join(os.environ.get("USERPROFILE", ""), "Desktop")
+        pass
+
+    # 备用方案
+    user_profile = os.environ.get("USERPROFILE", "")
+    if user_profile:
+        desktop = os.path.join(user_profile, "Desktop")
+        if os.path.exists(desktop) and os.access(desktop, os.W_OK):
+            return desktop
+
+    # 如果桌面不可用，使用文档文件夹
+    documents = os.path.join(os.path.expanduser("~"), "Documents")
+    if os.path.exists(documents) and os.access(documents, os.W_OK):
+        return documents
+
+    # 最后使用当前目录
+    return os.path.dirname(sys.executable) if hasattr(sys, 'frozen') else os.getcwd()
 
 
 def check_pdf_type(pdf_path):
@@ -44,6 +62,7 @@ def check_pdf_type(pdf_path):
         print(f"PDF类型检测异常: {str(e)}")
         return "扫描型"
 
+
 def clean_temp_files(file_list):
     for f in file_list:
         if os.path.exists(f):
@@ -52,12 +71,15 @@ def clean_temp_files(file_list):
             except:
                 pass
 
+
 def text_pdf_to_word(input_file, output_file, progress_callback=None):
     try:
         pdf_doc = fitz.open(input_file)
         total_pages = len(pdf_doc)
         doc = Document()
         section = doc.sections[0]
+        section.page_height = Cm(29.7)
+        section.page_width = Cm(21)
 
         if progress_callback:
             progress_callback(20)
@@ -119,6 +141,12 @@ def scan_pdf_to_word(input_file, output_file, progress_callback=None):
 
         doc = Document()
         section = doc.sections[0]
+        section.page_height = Cm(29.7)
+        section.page_width = Cm(21)
+        section.top_margin = Cm(1.27)
+        section.bottom_margin = Cm(1.27)
+        section.left_margin = Cm(1.27)
+        section.right_margin = Cm(1.27)
         image_width = section.page_width - section.left_margin - section.right_margin
 
         for i, img_path in enumerate(img_paths):
@@ -144,18 +172,51 @@ def scan_pdf_to_word(input_file, output_file, progress_callback=None):
         error_msg = f"扫描型PDF转换失败：{str(e)}"
         return False, error_msg
 
+
 def img_to_pdf(input_files, output_file, progress_callback=None):
     try:
-            img_list = []
-                    with Image.open(img_path) as img:
-                        # 转换RGBA为RGB
-                            img = img.convert("RGB")
-                        img_list.append(img)
+        # 确保输入文件是字符串列表
+        cleaned_files = []
+        for f in input_files:
+            if isinstance(f, tuple):
+                cleaned_files.append(str(f[0]))
+            elif isinstance(f, str):
+                cleaned_files.append(f)
+            else:
+                cleaned_files.append(str(f))
 
-                if progress_callback:
-                    progress_callback(progress)
+        input_files = cleaned_files
 
-            if img_list:
+        # 确保输出目录存在
+        output_dir = os.path.dirname(output_file)
+        if output_dir and not os.path.exists(output_dir):
+            os.makedirs(output_dir, exist_ok=True)
+
+        img_list = []
+        total_imgs = len(input_files)
+
+        # 检查所有输入文件是否存在
+        for img_path in input_files:
+            if not os.path.exists(img_path):
+                return False, f"图片文件不存在：{img_path}"
+
+        for idx, img_path in enumerate(input_files):
+            try:
+                with Image.open(img_path) as img:
+                    # 转换RGBA为RGB
+                    if img.mode in ("RGBA", "P"):
+                        img = img.convert("RGB")
+                    img_list.append(img)
+            except Exception as e:
+                return False, f"无法打开图片文件 {img_path}：{str(e)}"
+
+            if progress_callback:
+                progress = (idx + 1) / total_imgs * 90
+                progress_callback(progress)
+
+        # 保存为PDF
+        if img_list:
+            try:
                 img_list[0].save(
                     output_file,
                     "PDF",
@@ -163,10 +224,18 @@ def img_to_pdf(input_files, output_file, progress_callback=None):
                     append_images=img_list[1:] if len(img_list) > 1 else [],
                     quality=95
                 )
+            except Exception as e:
+                return False, f"保存PDF文件失败：{str(e)}"
+        else:
+            return False, "没有有效的图片可转换"
 
-                    if progress_callback:
-                        progress_callback(100)
+        if progress_callback:
+            progress_callback(100)
+        return True, f"图片转PDF完成！共转换{len(img_list)}张图片"
     except Exception as e:
+        error_msg = f"图片转PDF失败：{str(e)}"
+        traceback_info = traceback.format_exc()
+        return False, f"{error_msg}\n\n详细错误：{traceback_info}"
 
 
 def word_to_pdf(input_file, output_file, progress_callback=None):
@@ -262,6 +331,9 @@ def word_to_img(input_file, output_dir, progress_callback=None):
             if progress_callback:
                 progress_callback(100)
             return True, f"Word转图片完成！保存至：{output_dir}"
+
+        from PIL import ImageDraw, ImageFont
+
         for idx, para in enumerate(paragraphs):
             if para.text.strip():
                 img = Image.new('RGB', (800, 200), color='white')
@@ -274,6 +346,7 @@ def word_to_img(input_file, output_dir, progress_callback=None):
 
                 img_path = os.path.join(output_dir, f"word_page_{idx + 1}.png")
                 img.save(img_path)
+
             if progress_callback:
                 progress = (idx + 1) / total_paras * 100
                 progress_callback(progress)
@@ -372,11 +445,121 @@ def xls_to_word(input_file, output_file, progress_callback=None):
     except Exception as e:
         error_msg = f"XLS转Word失败：{str(e)}"
         return False, error_msg
+
+
+def show_image_order_dialog(files, file_path, root):
+    """显示图片排序对话框"""
+    order_dialog = tk.Toplevel(root)
+    order_dialog.title("调整图片顺序")
+    order_dialog.geometry("600x500")
+    order_dialog.configure(bg="#f8f9fa")
+    order_dialog.resizable(False, False)
+
+    order_dialog.update_idletasks()
+    w = order_dialog.winfo_width()
+    h = order_dialog.winfo_height()
+    x = (root.winfo_screenwidth() - w) // 2
+    y = (root.winfo_screenheight() - h) // 2
+    order_dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+    tk.Label(order_dialog, text="📷 请拖动调整图片顺序（从上到下为PDF顺序）",
+             font=("微软雅黑", 12), bg="#f8f9fa", fg="#0d6efd").pack(pady=10)
+
+    listbox_frame = tk.Frame(order_dialog)
+    listbox_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+    scrollbar = tk.Scrollbar(listbox_frame)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    listbox = tk.Listbox(listbox_frame, selectmode=tk.SINGLE,
+                         yscrollcommand=scrollbar.set,
+                         font=("微软雅黑", 10), height=15)
+    listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.config(command=listbox.yview)
+
+    # 添加文件到列表框
+    for i, f in enumerate(files):
+        filename = os.path.basename(f)
+        listbox.insert(tk.END, f"{i + 1}. {filename}")
+
+    # 存储原始文件列表
+    listbox.file_paths = [str(f) for f in files]
+
+    def move_up():
+        index = listbox.curselection()
+        if index and index[0] > 0:
+            idx = index[0]
+            item_text = listbox.get(idx)
+            listbox.delete(idx)
+            listbox.insert(idx - 1, item_text)
+            listbox.selection_set(idx - 1)
+            file_paths = listbox.file_paths
+            item = file_paths.pop(idx)
+            file_paths.insert(idx - 1, item)
+            listbox.file_paths = file_paths
+
+    def move_down():
+        index = listbox.curselection()
+        if index and index[0] < listbox.size() - 1:
+            idx = index[0]
+            item_text = listbox.get(idx)
+            listbox.delete(idx)
+            listbox.insert(idx + 1, item_text)
+            listbox.selection_set(idx + 1)
+            file_paths = listbox.file_paths
+            item = file_paths.pop(idx)
+            file_paths.insert(idx + 1, item)
+            listbox.file_paths = file_paths
+
+    def confirm_order():
+        root.file_list = listbox.file_paths
+
+        ordered_files = listbox.file_paths
+        if len(ordered_files) == 1:
+            display = f"✅ 已选中：\n{ordered_files[0]}"
+        else:
+            display = f"✅ 已选中 {len(ordered_files)} 个图片文件（已排序）\n"
+            for i, f in enumerate(ordered_files[:3]):
+                display += f"{i + 1}. {os.path.basename(f)}\n"
+            if len(ordered_files) > 3:
+                display += f"...等{len(ordered_files)}个文件"
+
+        file_path.set(display)
+        order_dialog.destroy()
+
+    def cancel_order():
+        order_dialog.destroy()
+
+    button_frame = tk.Frame(order_dialog, bg="#f8f9fa")
+    button_frame.pack(pady=10)
+
+    btn_up = tk.Button(button_frame, text="↑ 上移", command=move_up,
+                       font=("微软雅黑", 10), bg="#6c757d", fg="white",
+                       padx=15, pady=5, relief=tk.FLAT)
+    btn_up.pack(side=tk.LEFT, padx=5)
+
+    btn_down = tk.Button(button_frame, text="↓ 下移", command=move_down,
+                         font=("微软雅黑", 10), bg="#6c757d", fg="white",
+                         padx=15, pady=5, relief=tk.FLAT)
+    btn_down.pack(side=tk.LEFT, padx=5)
+
+    btn_confirm = tk.Button(button_frame, text="✅ 确认顺序", command=confirm_order,
+                            font=("微软雅黑", 10, "bold"), bg="#0d6efd", fg="white",
+                            padx=20, pady=5, relief=tk.FLAT)
+    btn_confirm.pack(side=tk.LEFT, padx=20)
+
+    btn_cancel = tk.Button(button_frame, text="❌ 取消", command=cancel_order,
+                           font=("微软雅黑", 10), bg="#dc3545", fg="white",
+                           padx=15, pady=5, relief=tk.FLAT)
+    btn_cancel.pack(side=tk.LEFT, padx=5)
+
+
 def select_file(converter_type, file_path, root):
     file_path.set("")
     title_map = {
         "pdf2word": "选择要转换的PDF文件",
         "word2pdf": "选择要转换的Word文件",
+        "img2pdf": "选择要转换的图片文件（可多选）",
         "word2img": "选择要转换的Word文件",
         "pdf2img": "选择要转换的PDF文件",
         "xls2word": "选择要转换的Excel文件"
@@ -391,7 +574,13 @@ def select_file(converter_type, file_path, root):
     }
 
     files = filedialog.askopenfilenames(title=title_map[converter_type], filetypes=type_map[converter_type])
+
     if files:
+        # 对于图片转PDF且选择了多个文件，显示排序界面
+        if converter_type == "img2pdf" and len(files) > 1:
+            show_image_order_dialog(files, file_path, root)
+        else:
+            root.file_list = [str(f) for f in files]
             display = f"✅ 已选中：\n{files[0]}" if len(files) == 1 else f"✅ 已选中 {len(files)} 个文件"
             file_path.set(display)
 
@@ -403,6 +592,7 @@ def update_progress(value, progress_var, root):
 
 def convert_thread(converter_type, input_files, new_name, root, progress_var, convert_btn, name_entry, file_path):
     desktop = get_real_desktop_path()
+
     if not os.path.exists(desktop) or not os.access(desktop, os.W_OK):
         desktop = os.path.dirname(sys.executable) if hasattr(sys, 'frozen') else os.getcwd()
         root.after(0, lambda: messagebox.showwarning("权限提示", f"桌面不可写，保存到：\n{desktop}"))
@@ -441,6 +631,11 @@ def convert_thread(converter_type, input_files, new_name, root, progress_var, co
             )
 
         elif converter_type == "img2pdf":
+            if not new_name.lower().endswith('.pdf'):
+                new_name = f"{new_name}.pdf"
+
+            output = os.path.join(desktop, new_name)
+
             success, msg = img_to_pdf(
                 input_files,
                 output,
@@ -478,6 +673,8 @@ def convert_thread(converter_type, input_files, new_name, root, progress_var, co
             msg = "无效转换类型"
 
     except Exception as e:
+        error_trace = traceback.format_exc()
+        msg = f"执行异常：{type(e).__name__} - {str(e)}\n\n详细错误：{error_trace}"
 
     root.after(0, lambda: finish_convert(success, msg, output, root, convert_btn, progress_var, name_entry, file_path))
 
@@ -487,10 +684,12 @@ def finish_convert(success, msg, output, root, convert_btn, progress_var, name_e
     progress_var.set(0)
 
     if success:
+        messagebox.showinfo("转换成功 🎉", f"{msg}")
         name_entry.delete(0, tk.END)
         file_path.set("")
         root.file_list = []
     else:
+        error_msg = f"转换失败 ❌\n\n{msg}"
         messagebox.showerror("错误", error_msg)
 
 
@@ -511,7 +710,9 @@ def start_convert(var, root, progress_var, convert_btn, name_entry, file_path):
 
     # 检查文件是否存在
     for file in input_files:
-            messagebox.showerror("错误", f"选中的文件不存在：\n{file}")
+        file_str = str(file)
+        if not os.path.exists(file_str):
+            messagebox.showerror("错误", f"选中的文件不存在：\n{file_str}")
             return
 
     convert_btn.config(state=tk.DISABLED, text="⏳ 转换中...")
@@ -523,6 +724,7 @@ def start_convert(var, root, progress_var, convert_btn, name_entry, file_path):
         daemon=True
     )
     t.start()
+
 
 if __name__ == "__main__":
     root = tk.Tk()
