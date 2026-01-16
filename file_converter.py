@@ -4,7 +4,7 @@ import logging
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import img2pdf
-from PIL import Image
+from PIL import Image, ImageTk
 import threading
 import fitz
 import openpyxl
@@ -29,7 +29,6 @@ def get_real_desktop_path():
     except:
         pass
 
-    # 备用方案
     user_profile = os.environ.get("USERPROFILE", "")
     if user_profile:
         desktop = os.path.join(user_profile, "Desktop")
@@ -206,7 +205,9 @@ def img_to_pdf(input_files, output_file, progress_callback=None):
                     # 转换RGBA为RGB
                     if img.mode in ("RGBA", "P"):
                         img = img.convert("RGB")
-                    img_list.append(img)
+                    # 复制图像数据，确保它在内存中保持活跃
+                    img_copy = img.copy()
+                    img_list.append(img_copy)
             except Exception as e:
                 return False, f"无法打开图片文件 {img_path}：{str(e)}"
 
@@ -217,15 +218,38 @@ def img_to_pdf(input_files, output_file, progress_callback=None):
         # 保存为PDF
         if img_list:
             try:
-                img_list[0].save(
-                    output_file,
-                    "PDF",
-                    save_all=True,
-                    append_images=img_list[1:] if len(img_list) > 1 else [],
-                    quality=95
-                )
+                # 使用临时文件方式避免直接写入失败
+                temp_output = output_file + ".tmp"
+                if len(img_list) == 1:
+                    img_list[0].save(temp_output, "PDF", resolution=100.0)
+                else:
+                    img_list[0].save(
+                        temp_output,
+                        "PDF",
+                        save_all=True,
+                        append_images=img_list[1:],
+                        resolution=100.0
+                    )
+                
+                # 如果临时文件创建成功，则替换原文件
+                if os.path.exists(temp_output):
+                    if os.path.exists(output_file):
+                        os.remove(output_file)
+                    os.rename(temp_output, output_file)
             except Exception as e:
-                return False, f"保存PDF文件失败：{str(e)}"
+                # 尝试使用img2pdf作为备用方案
+                try:
+                    import img2pdf
+                    with open(output_file, "wb") as f:
+                        f.write(img2pdf.convert(input_files))
+                except Exception as e2:
+                    # 如果备用方案也失败，返回原始错误
+                    if os.path.exists(output_file + ".tmp"):
+                        try:
+                            os.remove(output_file + ".tmp")
+                        except:
+                            pass
+                    return False, f"保存PDF文件失败：{str(e)}，备用方案也失败：{str(e2)}"
         else:
             return False, "没有有效的图片可转换"
 
@@ -447,111 +471,440 @@ def xls_to_word(input_file, output_file, progress_callback=None):
         return False, error_msg
 
 
-def show_image_order_dialog(files, file_path, root):
-    """显示图片排序对话框"""
-    order_dialog = tk.Toplevel(root)
-    order_dialog.title("调整图片顺序")
-    order_dialog.geometry("600x500")
-    order_dialog.configure(bg="#f8f9fa")
-    order_dialog.resizable(False, False)
+def show_image_grid_dialog(files, file_path, root):
+    """显示图片网格预览对话框，支持拖动排序和删除"""
+    grid_dialog = tk.Toplevel(root)
+    grid_dialog.title("图片网格预览与排序")
+    grid_dialog.geometry("1000x700")
+    grid_dialog.configure(bg="#f8f9fa")
+    
+    # 居中显示
+    grid_dialog.update_idletasks()
+    w = grid_dialog.winfo_width()
+    h = grid_dialog.winfo_height()
+    x = (root.winfo_screenwidth() // 2) - (w // 2)
+    y = (root.winfo_screenheight() // 2) - (h // 2)
+    grid_dialog.geometry(f"{w}x{h}+{x}+{y}")
 
-    order_dialog.update_idletasks()
-    w = order_dialog.winfo_width()
-    h = order_dialog.winfo_height()
-    x = (root.winfo_screenwidth() - w) // 2
-    y = (root.winfo_screenheight() - h) // 2
-    order_dialog.geometry(f"{w}x{h}+{x}+{y}")
+    # 存储文件路径和对应的预览图片
+    file_data = []
+    for f in files:
+        file_data.append({
+            'path': str(f),
+            'thumbnail': None,
+            'label': None  # 用于存储tkinter Label组件
+        })
 
-    tk.Label(order_dialog, text="📷 请拖动调整图片顺序（从上到下为PDF顺序）",
-             font=("微软雅黑", 12), bg="#f8f9fa", fg="#0d6efd").pack(pady=10)
+    # 创建主框架
+    main_frame = tk.Frame(grid_dialog, bg="#f8f9fa")
+    main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    listbox_frame = tk.Frame(order_dialog)
-    listbox_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+    # 创建画布和滚动条
+    canvas_frame = tk.Frame(main_frame)
+    canvas_frame.pack(fill=tk.BOTH, expand=True)
 
-    scrollbar = tk.Scrollbar(listbox_frame)
-    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas = tk.Canvas(canvas_frame, bg="white")
+    v_scrollbar = tk.Scrollbar(canvas_frame, orient=tk.VERTICAL, command=canvas.yview)
+    h_scrollbar = tk.Scrollbar(main_frame, orient=tk.HORIZONTAL, command=canvas.xview)
+    
+    canvas.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
 
-    listbox = tk.Listbox(listbox_frame, selectmode=tk.SINGLE,
-                         yscrollcommand=scrollbar.set,
-                         font=("微软雅黑", 10), height=15)
-    listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-    scrollbar.config(command=listbox.yview)
+    v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
 
-    # 添加文件到列表框
-    for i, f in enumerate(files):
-        filename = os.path.basename(f)
-        listbox.insert(tk.END, f"{i + 1}. {filename}")
+    # 创建预览框架
+    preview_frame = tk.Frame(canvas, bg="white")
+    canvas.create_window((0, 0), window=preview_frame, anchor=tk.NW)
 
-    # 存储原始文件列表
-    listbox.file_paths = [str(f) for f in files]
+    # 用于存储拖动信息
+    drag_data = {"widget": None, "start_x": 0, "start_y": 0, "index": None}
 
-    def move_up():
-        index = listbox.curselection()
-        if index and index[0] > 0:
-            idx = index[0]
-            item_text = listbox.get(idx)
-            listbox.delete(idx)
-            listbox.insert(idx - 1, item_text)
-            listbox.selection_set(idx - 1)
-            file_paths = listbox.file_paths
-            item = file_paths.pop(idx)
-            file_paths.insert(idx - 1, item)
-            listbox.file_paths = file_paths
+    def load_thumbnails():
+        """加载所有图片的缩略图"""
+        for i, data in enumerate(file_data):
+            try:
+                img = Image.open(data['path'])
+                # 创建缩略图
+                img.thumbnail((150, 150), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(img)
+                data['thumbnail'] = photo
+            except Exception as e:
+                print(f"无法加载缩略图: {data['path']}, 错误: {e}")
 
-    def move_down():
-        index = listbox.curselection()
-        if index and index[0] < listbox.size() - 1:
-            idx = index[0]
-            item_text = listbox.get(idx)
-            listbox.delete(idx)
-            listbox.insert(idx + 1, item_text)
-            listbox.selection_set(idx + 1)
-            file_paths = listbox.file_paths
-            item = file_paths.pop(idx)
-            file_paths.insert(idx + 1, item)
-            listbox.file_paths = file_paths
+    def create_preview_grid():
+        #创建预览网格
+        # 清除现有组件
+        for widget in preview_frame.winfo_children():
+            widget.destroy()
+        
+        # 每行显示6张图片
+        cols = 6
+        for i, data in enumerate(file_data):
+            row = i // cols
+            col = i % cols
+            
+            # 创建包含图片和控制按钮的框架
+            img_frame = tk.Frame(preview_frame, relief=tk.RAISED, bd=2, bg="white")
+            img_frame.grid(row=row, column=col, padx=10, pady=10)
+            
+            # 显示缩略图
+            if data['thumbnail']:
+                img_label = tk.Label(img_frame, image=data['thumbnail'], bg="white", relief=tk.SUNKEN)
+            else:
+                img_label = tk.Label(img_frame, text="图片\n加载失败", width=20, height=10, 
+                                   bg="lightgray", relief=tk.SUNKEN)
+            
+            img_label.grid(row=0, column=0, columnspan=2)
+            data['label'] = img_label  # 保存引用用于拖动
+            
+            # 文件名
+            filename = os.path.basename(data['path'])
+            name_label = tk.Label(img_frame, text=filename[:15] + "..." if len(filename) > 15 else filename, 
+                                font=("微软雅黑", 8), bg="white")
+            name_label.grid(row=1, column=0, columnspan=2, pady=(5, 0))
+            
+            # 删除按钮
+            delete_btn = tk.Button(img_frame, text="🗑", font=("微软雅黑", 8), 
+                                 command=lambda idx=i: delete_image(idx),
+                                 bg="#dc3545", fg="white", width=3)
+            delete_btn.grid(row=2, column=0, padx=2, pady=5, sticky=tk.E)
+            
+            # 上移按钮
+            up_btn = tk.Button(img_frame, text="⬆", font=("微软雅黑", 8), 
+                             command=lambda idx=i: move_image_up(idx),
+                             bg="#ffc107", fg="black", width=3)
+            up_btn.grid(row=2, column=1, padx=2, pady=5, sticky=tk.W)
+            
+            # 绑定拖动事件
+            img_label.bind("<Button-1>", lambda e, idx=i: start_drag(e, idx))
+            img_label.bind("<B1-Motion>", drag_motion)
+            img_label.bind("<ButtonRelease-1>", lambda e, idx=i: stop_drag(e, idx))
+
+    def start_drag(event, index):
+        """开始拖动"""
+        drag_data["widget"] = file_data[index]['label']
+        drag_data["start_x"] = event.x
+        drag_data["start_y"] = event.y
+        drag_data["index"] = index
+        # 提升到顶层
+        drag_data["widget"].lift()
+
+    def drag_motion(event):
+        """拖动中"""
+        if drag_data["widget"]:
+            x = drag_data["widget"].winfo_x() - drag_data["start_x"] + event.x
+            y = drag_data["widget"].winfo_y() - drag_data["start_y"] + event.y
+            # 由于Label在Frame内，我们需要使用place来精确定位
+            drag_data["widget"].master.update()  # 更新布局
+            drag_data["widget"].place(x=x, y=y)
+            drag_data["widget"].lift()
+
+    def stop_drag(event, index):
+        """停止拖动"""
+        if drag_data["widget"]:
+            # 计算当前鼠标位置在网格中的目标位置
+            canvas_x = canvas.canvasx(event.x)
+            canvas_y = canvas.canvasy(event.y)
+            
+            # 获取所有图片框架的位置
+            target_idx = find_drop_target(canvas_x, canvas_y, index)
+            if target_idx is not None and target_idx != index:
+                # 交换图片位置
+                file_data[index], file_data[target_idx] = file_data[target_idx], file_data[index]
+                create_preview_grid()  # 重新创建网格
+                
+            drag_data["widget"] = None
+            drag_data["index"] = None
+            # 重新加载网格以反映新顺序
+
+    def find_drop_target(x, y, source_idx):
+        """找到拖放目标位置"""
+        min_dist = float('inf')
+        target_idx = None
+        
+        cols = 6
+        for i, data in enumerate(file_data):
+            if i == source_idx:
+                continue
+            row = i // cols
+            col = i % cols
+            # 计算每个框架的大致位置
+            frame_x = col * 170 + 85  # 170是框架宽度+间距，85是中心点
+            frame_y = row * 220 + 110  # 220是框架高度+间距，110是中心点
+            
+            dist = ((x - frame_x) ** 2 + (y - frame_y) ** 2) ** 0.5
+            if dist < min_dist:
+                min_dist = dist
+                target_idx = i
+        
+        # 如果距离足够近，则认为是有效拖放
+        if min_dist < 100:
+            return target_idx
+        return None
+
+    def delete_image(index):
+        """删除指定索引的图片"""
+        if messagebox.askyesno("确认删除", f"确定要删除图片 {os.path.basename(file_data[index]['path'])} 吗？"):
+            file_data.pop(index)
+            create_preview_grid()
+
+    def move_image_up(index):
+        """上移图片"""
+        if index > 0:
+            file_data[index], file_data[index-1] = file_data[index-1], file_data[index]
+            create_preview_grid()
 
     def confirm_order():
-        root.file_list = listbox.file_paths
-
-        ordered_files = listbox.file_paths
-        if len(ordered_files) == 1:
-            display = f"✅ 已选中：\n{ordered_files[0]}"
+        """确认排序"""
+        ordered_paths = [data['path'] for data in file_data]
+        root.file_list = ordered_paths
+        
+        # 更新主界面显示
+        if len(ordered_paths) == 1:
+            display = f"✅ 已选中：\n{ordered_paths[0]}"
         else:
-            display = f"✅ 已选中 {len(ordered_files)} 个图片文件（已排序）\n"
-            for i, f in enumerate(ordered_files[:3]):
+            display = f"✅ 已选中 {len(ordered_paths)} 个图片文件（已排序）\n"
+            for i, f in enumerate(ordered_paths[:3]):
                 display += f"{i + 1}. {os.path.basename(f)}\n"
-            if len(ordered_files) > 3:
-                display += f"...等{len(ordered_files)}个文件"
-
+            if len(ordered_paths) > 3:
+                display += f"...等{len(ordered_paths)}个文件"
+        
         file_path.set(display)
-        order_dialog.destroy()
+        grid_dialog.destroy()
 
     def cancel_order():
-        order_dialog.destroy()
+        """取消排序"""
+        grid_dialog.destroy()
 
-    button_frame = tk.Frame(order_dialog, bg="#f8f9fa")
+    # 加载缩略图并创建网格
+    load_thumbnails()
+    create_preview_grid()
+
+    # 更新滚动区域
+    preview_frame.update_idletasks()
+    # 为Canvas设置滚动区域
+    canvas.config(scrollregion=canvas.bbox("all"))
+
+    # 按钮框架
+    button_frame = tk.Frame(grid_dialog, bg="#f8f9fa")
     button_frame.pack(pady=10)
 
-    btn_up = tk.Button(button_frame, text="↑ 上移", command=move_up,
-                       font=("微软雅黑", 10), bg="#6c757d", fg="white",
-                       padx=15, pady=5, relief=tk.FLAT)
-    btn_up.pack(side=tk.LEFT, padx=5)
-
-    btn_down = tk.Button(button_frame, text="↓ 下移", command=move_down,
-                         font=("微软雅黑", 10), bg="#6c757d", fg="white",
-                         padx=15, pady=5, relief=tk.FLAT)
-    btn_down.pack(side=tk.LEFT, padx=5)
-
-    btn_confirm = tk.Button(button_frame, text="✅ 确认顺序", command=confirm_order,
+    btn_confirm = tk.Button(button_frame, text="✅ 确认排序", command=confirm_order,
                             font=("微软雅黑", 10, "bold"), bg="#0d6efd", fg="white",
-                            padx=20, pady=5, relief=tk.FLAT)
-    btn_confirm.pack(side=tk.LEFT, padx=20)
+                            padx=20, pady=5)
+    btn_confirm.pack(side=tk.LEFT, padx=10)
 
     btn_cancel = tk.Button(button_frame, text="❌ 取消", command=cancel_order,
                            font=("微软雅黑", 10), bg="#dc3545", fg="white",
-                           padx=15, pady=5, relief=tk.FLAT)
-    btn_cancel.pack(side=tk.LEFT, padx=5)
+                           padx=15, pady=5)
+    btn_cancel.pack(side=tk.LEFT, padx=10)
+
+    # 刷新按钮
+    btn_refresh = tk.Button(button_frame, text="🔄 刷新", command=create_preview_grid,
+                           font=("微软雅黑", 10), bg="#28a745", fg="white",
+                           padx=15, pady=5)
+    btn_refresh.pack(side=tk.LEFT, padx=10)
+
+
+def show_image_order_dialog(files, file_path, root):
+    """显示图片排序对话框（保留原有的列表排序方式）"""
+    # 创建新对话框使用网格预览
+    show_image_grid_dialog(files, file_path, root)
+
+
+def manage_file_list(converter_type, file_path, root):
+    """管理文件列表，包括预览、删除和排序功能"""
+    
+    def preview_image(file_path):
+        """预览图片文件"""
+        try:
+            img = Image.open(file_path)
+            
+            # 创建预览窗口
+            preview_window = tk.Toplevel(root)
+            preview_window.title(f"预览: {os.path.basename(file_path)}")
+            preview_window.geometry("600x500")
+            preview_window.configure(bg="#f8f9fa")
+            
+            # 调整图片大小以适应窗口
+            img_width, img_height = img.size
+            max_width, max_height = 550, 400
+            
+            scale = min(max_width/img_width, max_height/img_height)
+            if scale < 1:
+                new_size = (int(img_width*scale), int(img_height*scale))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            
+            # 转换为tkinter可用的格式
+            photo = ImageTk.PhotoImage(img)
+            
+            # 创建画布显示图片
+            canvas = tk.Canvas(preview_window, width=min(img_width, max_width), 
+                              height=min(img_height, max_height), bg="white")
+            canvas.pack(pady=10, padx=10)
+            canvas.create_image(0, 0, anchor=tk.NW, image=photo)
+            
+            # 保持图片引用防止被垃圾回收
+            canvas.image = photo
+            
+            # 添加关闭按钮
+            close_btn = tk.Button(preview_window, text="关闭", command=preview_window.destroy,
+                                 font=("微软雅黑", 10), bg="#0d6efd", fg="white")
+            close_btn.pack(pady=10)
+            
+        except Exception as e:
+            messagebox.showerror("预览错误", f"无法预览图片: {str(e)}")
+    
+    def delete_selected():
+        """删除选中的文件"""
+        selected_indices = listbox.curselection()
+        if not selected_indices:
+            messagebox.showwarning("删除", "请先选择要删除的文件")
+            return
+        
+        # 从后往前删除，避免索引变化
+        for index in reversed(selected_indices):
+            root.file_list.pop(index)
+        
+        update_list_display()
+    
+    def move_up():
+        """上移选中的文件"""
+        selected_indices = listbox.curselection()
+        if not selected_indices or selected_indices[0] == 0:
+            return
+        
+        index = selected_indices[0]
+        # 交换元素
+        root.file_list[index], root.file_list[index-1] = root.file_list[index-1], root.file_list[index]
+        
+        update_list_display()
+        listbox.selection_set(index-1)
+    
+    def move_down():
+        """下移选中的文件"""
+        selected_indices = listbox.curselection()
+        if not selected_indices or selected_indices[0] >= len(root.file_list)-1:
+            return
+        
+        index = selected_indices[0]
+        # 交换元素
+        root.file_list[index], root.file_list[index+1] = root.file_list[index+1], root.file_list[index]
+        
+        update_list_display()
+        listbox.selection_set(index+1)
+    
+    def update_list_display():
+        """更新列表显示"""
+        listbox.delete(0, tk.END)
+        for i, file_path in enumerate(root.file_list):
+            filename = os.path.basename(file_path)
+            listbox.insert(tk.END, f"{i+1}. {filename}")
+        
+        # 更新显示文本
+        if len(root.file_list) == 0:
+            file_path.set("")
+        elif len(root.file_list) == 1:
+            file_path.set(f"✅ 已选中：\n{os.path.basename(root.file_list[0])}")
+        else:
+            file_path.set(f"✅ 已选中 {len(root.file_list)} 个文件")
+    
+    def confirm_selection():
+        """确认选择"""
+        manager_window.destroy()
+    
+    # 创建管理窗口
+    manager_window = tk.Toplevel(root)
+    manager_window.title("文件管理")
+    manager_window.geometry("700x500")
+    manager_window.configure(bg="#f8f9fa")
+    
+    # 居中显示
+    manager_window.update_idletasks()
+    w = manager_window.winfo_width()
+    h = manager_window.winfo_height()
+    x = (manager_window.winfo_screenwidth() // 2) - (w // 2)
+    y = (manager_window.winfo_screenheight() // 2) - (h // 2)
+    manager_window.geometry(f"{w}x{h}+{x}+{y}")
+    
+    tk.Label(manager_window, text="📁 已选择的文件", font=("微软雅黑", 12, "bold"),
+             bg="#f8f9fa", fg="#0d6efd").pack(pady=10)
+    
+    # 文件列表
+    list_frame = tk.Frame(manager_window)
+    list_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+    
+    scrollbar = tk.Scrollbar(list_frame)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    listbox = tk.Listbox(list_frame, selectmode=tk.SINGLE, yscrollcommand=scrollbar.set,
+                         font=("微软雅黑", 10), height=15, bg="white", fg="#333333")
+    listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.config(command=listbox.yview)
+    
+    # 填充列表
+    update_list_display()
+    
+    # 按钮框架
+    button_frame = tk.Frame(manager_window, bg="#f8f9fa")
+    button_frame.pack(pady=15)
+    
+    # 预览按钮
+    preview_btn = tk.Button(button_frame, text="👁 预览", command=lambda: (
+        preview_image(root.file_list[listbox.curselection()[0]]) if listbox.curselection() else 
+        messagebox.showwarning("预览", "请先选择要预览的文件")
+    ), font=("微软雅黑", 10), bg="#28a745", fg="white", padx=15, pady=5)
+    preview_btn.pack(side=tk.LEFT, padx=5)
+    
+    # 删除按钮
+    delete_btn = tk.Button(button_frame, text="🗑 删除", command=delete_selected,
+                          font=("微软雅黑", 10), bg="#dc3545", fg="white", padx=15, pady=5)
+    delete_btn.pack(side=tk.LEFT, padx=5)
+    
+    # 上移按钮
+    up_btn = tk.Button(button_frame, text="↑ 上移", command=move_up,
+                       font=("微软雅黑", 10), bg="#ffc107", fg="#212529", padx=15, pady=5)
+    up_btn.pack(side=tk.LEFT, padx=5)
+    
+    # 下移按钮
+    down_btn = tk.Button(button_frame, text="↓ 下移", command=move_down,
+                         font=("微软雅黑", 10), bg="#ffc107", fg="#212529", padx=15, pady=5)
+    down_btn.pack(side=tk.LEFT, padx=5)
+    
+    # 确认按钮
+    confirm_btn = tk.Button(button_frame, text="✅ 确认", command=confirm_selection,
+                           font=("微软雅黑", 10, "bold"), bg="#0d6efd", fg="white", padx=20, pady=5)
+    confirm_btn.pack(side=tk.LEFT, padx=20)
+    
+    # 添加文件按钮
+    def add_more_files():
+        title_map = {
+            "pdf2word": "选择要转换的PDF文件",
+            "word2pdf": "选择要转换的Word文件",
+            "img2pdf": "选择要转换的图片文件（可多选）",
+            "word2img": "选择要转换的Word文件",
+            "pdf2img": "选择要转换的PDF文件",
+            "xls2word": "选择要转换的Excel文件"
+        }
+        type_map = {
+            "pdf2word": [("PDF文件", "*.pdf"), ("所有文件", "*.*")],
+            "word2pdf": [("Word文件", "*.docx;*.doc"), ("所有文件", "*.*")],
+            "img2pdf": [("图片文件", "*.jpg;*.jpeg;*.png;*.bmp;*.gif"), ("所有文件", "*.*")],
+            "word2img": [("Word文件", "*.docx;*.doc"), ("所有文件", "*.*")],
+            "pdf2img": [("PDF文件", "*.pdf"), ("所有文件", "*.*")],
+            "xls2word": [("Excel文件", "*.xls;*.xlsx"), ("所有文件", "*.*")]
+        }
+        
+        files = filedialog.askopenfilenames(title=title_map[converter_type], filetypes=type_map[converter_type])
+        
+        if files:
+            root.file_list.extend([str(f) for f in files])
+            update_list_display()
+    
+    add_btn = tk.Button(button_frame, text="➕ 添加", command=add_more_files,
+                        font=("微软雅黑", 10), bg="#17a2b8", fg="white", padx=15, pady=5)
+    add_btn.pack(side=tk.LEFT, padx=5)
 
 
 def select_file(converter_type, file_path, root):
@@ -583,6 +936,11 @@ def select_file(converter_type, file_path, root):
             root.file_list = [str(f) for f in files]
             display = f"✅ 已选中：\n{files[0]}" if len(files) == 1 else f"✅ 已选中 {len(files)} 个文件"
             file_path.set(display)
+            
+            # 如果是图片文件，提供管理选项
+            if converter_type in ["img2pdf"] and len(files) > 1:
+                if messagebox.askyesno("文件管理", f"已选择 {len(files)} 个文件，是否需要管理（预览/排序/删除）？"):
+                    manage_file_list(converter_type, file_path, root)
 
 
 def update_progress(value, progress_var, root):
@@ -593,8 +951,27 @@ def update_progress(value, progress_var, root):
 def convert_thread(converter_type, input_files, new_name, root, progress_var, convert_btn, name_entry, file_path):
     desktop = get_real_desktop_path()
 
+    # 确保桌面路径存在且可写
     if not os.path.exists(desktop) or not os.access(desktop, os.W_OK):
-        desktop = os.path.dirname(sys.executable) if hasattr(sys, 'frozen') else os.getcwd()
+        # 如果桌面不可用，尝试其他常见路径
+        fallback_paths = [
+            os.path.join(os.path.expanduser("~"), "Documents"),
+            os.path.join(os.path.expanduser("~"), "Downloads"),
+            os.path.dirname(sys.executable) if hasattr(sys, 'frozen') else os.getcwd(),
+            os.getcwd()
+        ]
+        
+        desktop = None
+        for path in fallback_paths:
+            if os.path.exists(path) and os.access(path, os.W_OK):
+                desktop = path
+                break
+        
+        # 如果仍没有可用路径，创建一个临时目录
+        if desktop is None:
+            import tempfile
+            desktop = tempfile.mkdtemp(prefix="file_converter_")
+            
         root.after(0, lambda: messagebox.showwarning("权限提示", f"桌面不可写，保存到：\n{desktop}"))
 
     success = False
